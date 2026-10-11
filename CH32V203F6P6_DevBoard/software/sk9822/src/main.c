@@ -19,6 +19,10 @@
 // ?                        reply current color "#RRGGBB"
 // DEFAULT                  forget saved color, back to the built-in default
 //
+// Knob (rotary encoder with push button, see knob.h for wiring):
+// press                    switch between breathing and steady light
+// rotate right / left      brighter / darker (0..BRIGHTNESS_MAX, not saved)
+//
 // References:
 // -----------
 // - WCH Nanjing Qinheng Microelectronics: http://wch.cn
@@ -41,18 +45,22 @@
 #include <sk9822.h> // SK9822 LED strip functions
 #include <usb_cdc.h> // USB virtual serial port
 #include <storage.h> // saved color in flash
+#include <knob.h>    // rotary encoder knob
 
 #define PIN_LED       PB1           // define LED pin
 #define LED_PERIOD_MS (500) // toggle LED every 1 second
 #define NUM_LEDS        70    // LEDs on the strip
 #define FRAME_PERIOD_MS 5     // send a new frame every 5ms (200Hz)
 #define BREATHE_MS      10000 // one full breath (dark -> peak -> dark) in 10 seconds
-#define BREATHE_PEAK    12     // peak global brightness (1..31): breathe between 0 and 5
+#define BRIGHTNESS_MAX  6    // max global brightness (of 31): higher draws too much current
 #define SAVE_DELAY_MS   2000  // save color to flash once it stopped changing for 2s
 #define CMD_MAX_LEN     16    // longest serial command line
 
 static const SK9822_color_t DEFAULT_COLOR = {255, 40, 0}; // used if none is saved
 static SK9822_color_t s_color;                              // R, G, B at peak
+
+static uint8_t s_brightness = BRIGHTNESS_MAX; // global brightness 0..BRIGHTNESS_MAX (0: off)
+static uint8_t s_breathe = 1;                 // 1: breathing, 0: steady
 
 static uint8_t s_save_pending = 0; // color changed but not saved yet
 static uint32_t s_save_due;        // when to save it
@@ -63,6 +71,7 @@ static void ch32v203f6p6_setup()
     TIMER_init();        // start timer
     SK9822_init();       // init LED strip on SPI1 (SCK: PA5, MOSI: PA7)
     CDC_init();          // USB virtual serial port (PA11, PA12)
+    KNOB_init();         // rotary encoder (PA0, PA1) and button (PA2)
     if (!STORAGE_load(&s_color)) s_color = DEFAULT_COLOR;
 }
 
@@ -171,6 +180,7 @@ int main(void)
     ch32v203f6p6_setup();                          // init LED pin, timer and LED strip
     uint32_t led_next = MS_read() + LED_PERIOD_MS; // next LED toggle time
     uint32_t frame_next = MS_read();               // next LED strip frame time
+    uint32_t knob_next = MS_read();                // next knob button poll time
 
     // Loop (never blocks: add more tasks with their own "next" timestamp)
     while (1)
@@ -184,9 +194,19 @@ int main(void)
 
         if (MS_due(frame_next))
         {
-            uint16_t level = SK9822_breathe(MS_read(), BREATHE_MS, BREATHE_PEAK); // level from time, not frame count
+            uint16_t level = s_breathe
+                           ? SK9822_breathe(MS_read(), BREATHE_MS, s_brightness) // level from time, not frame count
+                           : 65535UL * s_brightness / 31;                       // steady at the breathing peak
             SK9822_show(s_color, NUM_LEDS, level);
             frame_next += FRAME_PERIOD_MS;
+        }
+
+        if (MS_due(knob_next))
+        {
+            if (KNOB_pressed()) s_breathe = !s_breathe; // toggle breathing / steady
+            int16_t b = s_brightness + KNOB_steps();    // right: brighter, left: darker
+            s_brightness = b < 0 ? 0 : b > BRIGHTNESS_MAX ? BRIGHTNESS_MAX : b;
+            knob_next += KNOB_POLL_MS;
         }
 
         poll_serial(); // color commands from the PC
