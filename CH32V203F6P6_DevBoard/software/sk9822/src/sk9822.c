@@ -4,6 +4,10 @@
 
 #include "sk9822.h"
 #include "spi.h"
+#include "timer.h"
+#include "usb_cdc.h"
+#include "storage.h"
+#include "knob.h"
 
 #define SK9822_GLOBAL_MAX 31 // 5-bit global brightness
 #define SK9822_LEVEL_MAX  65535UL
@@ -30,10 +34,26 @@ static const uint16_t SK9822_BREATHE_TABLE[SK9822_BREATHE_STEPS / 2 + 1] = {
     65535,
 };
 
+static SK9822_color_t s_color;                       // R, G, B at peak
+static uint8_t s_brightness = SK9822_BRIGHTNESS_MAX; // peak global brightness (0: off)
+static uint8_t s_breathe = 1;                        // 1: breathing, 0: steady
+static uint32_t s_frame_next;                        // next frame time
+static uint32_t s_knob_next;                         // next frame time
+
+static const SK9822_color_t SK9822_DEFAULT_COLOR = {255, 40, 0}; // used if none is saved
+static uint8_t s_save_pending = 0; // color changed but not saved yet
+static uint32_t s_save_due;        // when to save it
+
 // Init SPI1 for the LED strip
 void SK9822_init(void)
 {
     SPI1_init();
+    CDC_init();  // USB virtual serial port (PA11, PA12)
+    KNOB_init(); // rotary encoder (PA0, PA1) and button (PA2)
+
+    s_frame_next = MS_read();
+    s_knob_next = MS_read();
+    if (!STORAGE_load(&s_color)) s_color = SK9822_DEFAULT_COLOR;
 }
 
 // Scale one 8-bit channel by the PWM factor f (0..65535), rounded
@@ -75,4 +95,138 @@ uint16_t SK9822_breathe(uint32_t t_ms, uint32_t period_ms, uint8_t peak_global)
     int32_t b = SK9822_breathe_entry(i + 1);
     uint32_t level = a + (((b - a) * frac) >> 8);
     return level * peak_global / SK9822_GLOBAL_MAX;
+}
+
+// ===================================================================================
+// Serial Commands
+// ===================================================================================
+
+// Parse 2 hex digits; returns -1 if invalid
+static int16_t SK9822_parse_hex_byte(const char *s)
+{
+    int16_t value = 0;
+    for (uint8_t i = 0; i < 2; i++)
+    {
+        char c = s[i];
+        if (c >= '0' && c <= '9')      value = value * 16 + c - '0';
+        else if (c >= 'a' && c <= 'f') value = value * 16 + c - 'a' + 10;
+        else return -1;
+    }
+    return value;
+}
+
+// Reply with the current color as "#RRGGBB" (prefix "OK " after a change)
+static void SK9822_reply_color(uint8_t ok)
+{
+    static const char HEX[] = "0123456789ABCDEF";
+    char buf[11];
+    char *p = buf;
+    if (ok) { *p++ = 'O'; *p++ = 'K'; *p++ = ' '; }
+    *p++ = '#';
+    *p++ = HEX[s_color.r >> 4]; *p++ = HEX[s_color.r & 15];
+    *p++ = HEX[s_color.g >> 4]; *p++ = HEX[s_color.g & 15];
+    *p++ = HEX[s_color.b >> 4]; *p++ = HEX[s_color.b & 15];
+    *p = 0;
+    CDC_println(buf);
+}
+
+// Execute one command line (already lowercase, no line ending)
+static void SK9822_handle_command(const char *cmd, uint8_t len)
+{
+    if (len == 1 && cmd[0] == '?')
+    {
+        SK9822_reply_color(0);
+        return;
+    }
+
+    if (len == 7 && cmd[0] == '#') { cmd++; len--; }
+    if (len == 6)
+    {
+        int16_t r = SK9822_parse_hex_byte(cmd), g = SK9822_parse_hex_byte(cmd + 2), b = SK9822_parse_hex_byte(cmd + 4);
+        if (r >= 0 && g >= 0 && b >= 0)
+        {
+            s_color = (SK9822_color_t){r, g, b};
+            s_save_pending = 1;                  // save once the color settles
+            s_save_due = MS_read() + SK9822_SAVE_DELAY_MS;
+            SK9822_reply_color(1);
+            return;
+        }
+    }
+
+    const char *def = "default";
+    uint8_t i = 0;
+    while (i < len && cmd[i] == def[i]) i++;
+    if (len == 7 && i == 7)
+    {
+        STORAGE_clear();
+        s_save_pending = 0;
+        s_color = SK9822_DEFAULT_COLOR;
+        SK9822_reply_color(1);
+        return;
+    }
+
+    CDC_println("ERR");
+}
+
+// Collect received characters into lines and run them
+static void SK9822_poll_serial(void)
+{
+    static char line[SK9822_CMD_MAX_LEN + 1];
+    static uint8_t len = 0;
+    static uint8_t overflow = 0;
+
+    while (CDC_available())
+    {
+        char c = CDC_read();
+        if (c == '\r' || c == '\n')
+        {
+            if (overflow) CDC_println("ERR");
+            else if (len) SK9822_handle_command(line, len);
+            len = 0;
+            overflow = 0;
+        }
+        else if (len < SK9822_CMD_MAX_LEN)
+        {
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A'; // case-insensitive
+            line[len++] = c;
+        }
+        else overflow = 1; // too long: ignore the rest of the line
+    }
+}
+
+void SK9822_setColor(SK9822_color_t color) { s_color = color; }
+SK9822_color_t SK9822_getColor(void) { return s_color; }
+
+void SK9822_setBrightness(int16_t brightness)
+{
+    s_brightness = brightness < 0 ? 0 : brightness > SK9822_BRIGHTNESS_MAX ? SK9822_BRIGHTNESS_MAX : brightness;
+}
+uint8_t SK9822_getBrightness(void) { return s_brightness; }
+
+void SK9822_setBreathe(uint8_t on) { s_breathe = on ? 1 : 0; }
+uint8_t SK9822_getBreathe(void) { return s_breathe; }
+
+void SK9822_update(void)
+{
+    SK9822_poll_serial(); // color commands from the PC
+
+    if (s_save_pending && MS_due(s_save_due))
+    {
+        STORAGE_save(s_color); // only after the color settled: spares the flash
+        s_save_pending = 0;
+    }
+
+    if (!MS_due(s_frame_next)) return;
+    uint16_t level = s_breathe
+                         ? SK9822_breathe(MS_read(), SK9822_BREATHE_MS, s_brightness) // level from time, not frame count
+                         : SK9822_LEVEL_MAX * s_brightness / SK9822_GLOBAL_MAX;       // steady at the breathing peak
+    SK9822_show(s_color, SK9822_NUM_LEDS, level);
+    s_frame_next += SK9822_FRAME_MS; // advance from deadline: no drift
+
+    if (MS_due(s_knob_next))
+    {
+        if (KNOB_pressed()) SK9822_setBreathe(!SK9822_getBreathe());                 // toggle breathing / steady
+        if (!s_breathe) SK9822_setBrightness(SK9822_getBrightness() + KNOB_steps()); // right: brighter, left: darker (clamped)
+        s_knob_next += KNOB_POLL_MS;
+    }
 }

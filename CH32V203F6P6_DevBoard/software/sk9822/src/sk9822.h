@@ -4,9 +4,16 @@
 //
 // Functions available:
 // --------------------
-// SK9822_init()             Init SPI1 for the LED strip (SCK: PA5, MOSI: PA7)
+// SK9822_init()             Init SPI1 for the LED strip (SCK: PA5, MOSI: PA7), load saved color
 // SK9822_show(c, n, l)      Send n LEDs, all with color c, at master level l
 // SK9822_breathe(t, p, g)   Breathing level at time t (ms), period p (ms), peak global g
+// SK9822_update()           Main loop task: frames, serial commands, color saving
+// SK9822_setColor(c)        Set the strip color (R, G, B at peak)
+// SK9822_getColor()         Get the strip color
+// SK9822_setBrightness(b)   Set peak global brightness, clamped to 0..SK9822_BRIGHTNESS_MAX
+// SK9822_getBrightness()    Get peak global brightness (0: off)
+// SK9822_setBreathe(on)     1: breathing, 0: steady at the breathing peak
+// SK9822_getBreathe()       Get breathing mode
 //
 // Notes:
 // ------
@@ -25,6 +32,12 @@
 // 129-entry lookup table holds half the period (the curve is symmetric) and is
 // linearly interpolated. The level depends only on t, so late or skipped frames do
 // not change the speed.
+//
+// SK9822_update() never blocks except while a frame is sent: it sends one frame every
+// SK9822_FRAME_MS. It also runs the serial color commands (see main.c) and saves the
+// color to flash SK9822_SAVE_DELAY_MS after the last change. Call TIMER_init() before
+// SK9822_init(), and CDC_init() for the serial commands. The defaults below can be
+// overridden with compile definitions.
 
 #pragma once
 
@@ -34,6 +47,25 @@ extern "C" {
 
 #include "system.h"
 
+#ifndef SK9822_NUM_LEDS
+#define SK9822_NUM_LEDS       70    // LEDs on the strip
+#endif
+#ifndef SK9822_FRAME_MS
+#define SK9822_FRAME_MS       5     // send a new frame every 5ms (200Hz)
+#endif
+#ifndef SK9822_BREATHE_MS
+#define SK9822_BREATHE_MS     10000 // one full breath (dark -> peak -> dark) in 10 seconds
+#endif
+#ifndef SK9822_SAVE_DELAY_MS
+#define SK9822_SAVE_DELAY_MS  2000  // save color to flash once it stopped changing for 2s
+#endif
+#ifndef SK9822_CMD_MAX_LEN
+#define SK9822_CMD_MAX_LEN    16    // longest serial command line
+#endif
+#ifndef SK9822_BRIGHTNESS_MAX
+#define SK9822_BRIGHTNESS_MAX 6     // max global brightness (of 31): higher draws too much current
+#endif
+
 typedef struct
 {
     uint8_t r, g, b;
@@ -42,6 +74,14 @@ typedef struct
 void SK9822_init(void);
 void SK9822_show(SK9822_color_t color, uint16_t num_leds, uint16_t level);
 uint16_t SK9822_breathe(uint32_t t_ms, uint32_t period_ms, uint8_t peak_global);
+
+void SK9822_update(void);
+void SK9822_setColor(SK9822_color_t color);
+SK9822_color_t SK9822_getColor(void);
+void SK9822_setBrightness(int16_t brightness);
+uint8_t SK9822_getBrightness(void);
+void SK9822_setBreathe(uint8_t on);
+uint8_t SK9822_getBreathe(void);
 
 #ifdef __cplusplus
 };
