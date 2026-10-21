@@ -64,6 +64,9 @@ int main(void)
     ch32v203f6p6_setup();
     uint32_t led_next = MS_read() + LED_PERIOD_MS;
 
+    // Testing single light blur maximum brightness
+    SK9822_show((SK9822_color_t){255, 255, 255}, 1, 31);
+
     while (1)
     {
         IWDG_feed();
@@ -74,7 +77,5 @@ int main(void)
             PIN_toggle(PIN_LED);
             led_next += LED_PERIOD_MS;
         }
-
-        SK9822_update();
     }
 }
